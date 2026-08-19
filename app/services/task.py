@@ -37,9 +37,37 @@ def generate_terms(task_id, params, video_script):
     logger.info("\n\n## generating video terms")
     video_terms = params.video_terms
     if not video_terms:
-        video_terms = llm.generate_terms(
-            video_subject=params.video_subject, video_script=video_script, amount=5
-        )
+        if config.app.get("enable_sentence_keywords", False):
+            try:
+                sentence_terms, failure_reason = llm.generate_sentence_keywords(
+                    video_script
+                )
+            except Exception:
+                logger.info("sentence keywords fallback: unexpected error")
+                video_terms = llm.generate_terms(
+                    video_subject=params.video_subject,
+                    video_script=video_script,
+                    amount=5,
+                )
+            else:
+                if sentence_terms:
+                    logger.info(
+                        f"using sentence keywords: {len(sentence_terms)} terms from script"
+                    )
+                    video_terms = sentence_terms
+                else:
+                    logger.info(
+                        f"sentence keywords fallback: {failure_reason or 'unknown'}"
+                    )
+                    video_terms = llm.generate_terms(
+                        video_subject=params.video_subject,
+                        video_script=video_script,
+                        amount=5,
+                    )
+        else:
+            video_terms = llm.generate_terms(
+                video_subject=params.video_subject, video_script=video_script, amount=5
+            )
     else:
         if isinstance(video_terms, str):
             video_terms = [term.strip() for term in re.split(r"[,，]", video_terms)]

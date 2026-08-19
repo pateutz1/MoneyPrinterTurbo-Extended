@@ -2,7 +2,7 @@ import json
 import logging
 import re
 import requests
-from typing import List
+from typing import List, Optional, Tuple
 
 import g4f
 from loguru import logger
@@ -10,11 +10,170 @@ from openai import AzureOpenAI, OpenAI
 from openai.types.chat import ChatCompletion
 
 from app.config import config
+from app.utils import utils
 
 _max_retries = 5
+MAX_SENTENCE_KEYWORD_SEGMENTS = 5
 
 
-def _generate_response(prompt: str) -> str:
+def split_script_sentences(
+    video_script: str,
+    max_segments: int = MAX_SENTENCE_KEYWORD_SEGMENTS,
+) -> List[str]:
+    segments: List[str] = []
+    for part in utils.split_string_by_punctuations(video_script or ""):
+        normalized = " ".join(part.split())
+        if not normalized:
+            continue
+        segments.append(normalized)
+        if len(segments) >= max_segments:
+            break
+    return segments
+
+
+def extract_json_array_text(response: str) -> str:
+    text = (response or "").strip()
+    fenced = re.search(
+        r"```(?:json)?\s*(\[[\s\S]*?\])\s*```",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if fenced:
+        return fenced.group(1).strip()
+    bracketed = re.search(r"\[[\s\S]*\]", text)
+    if bracketed:
+        return bracketed.group(0).strip()
+    return text
+
+
+def normalize_sentence_keywords(keywords: List[str]) -> List[str]:
+    normalized: List[str] = []
+    for keyword in keywords:
+        cleaned = " ".join((keyword or "").split())
+        if cleaned:
+            normalized.append(cleaned)
+    return normalized
+
+
+def parse_sentence_keywords_response(
+    response: str, expected_count: int
+) -> List[str]:
+    if expected_count < 1 or expected_count > MAX_SENTENCE_KEYWORD_SEGMENTS:
+        raise ValueError("invalid sentence segment count")
+
+    payload = extract_json_array_text(response)
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        raise ValueError("malformed json")
+
+    if not isinstance(parsed, list):
+        raise ValueError("response is not a json array")
+
+    if len(parsed) != expected_count:
+        if len(parsed) > expected_count:
+            raise ValueError("excessive keyword count")
+        raise ValueError("incomplete keyword count")
+
+    keywords: List[str] = []
+    seen = set()
+    for item in parsed:
+        if not isinstance(item, str):
+            raise ValueError("non-string keyword entry")
+        cleaned = " ".join(item.split())
+        if not cleaned:
+            raise ValueError("empty keyword entry")
+        key = cleaned.casefold()
+        if key in seen:
+            raise ValueError("duplicate keyword entry")
+        seen.add(key)
+        keywords.append(cleaned)
+
+    if len(keywords) != expected_count:
+        raise ValueError("incomplete keyword count")
+    return keywords
+
+
+def _build_sentence_keywords_prompt(sentences: List[str]) -> str:
+    numbered = "\n".join(f"{index + 1}. {sentence}" for index, sentence in enumerate(sentences))
+    count = len(sentences)
+    return f"""
+# Role: Stock Footage Keyword Generator
+
+## Goal:
+Return exactly {count} concise English stock-footage search phrases, one per sentence below.
+
+## Rules:
+1. Reply with ONLY a JSON array of {count} strings.
+2. Each phrase should be 1-3 words and suitable for stock video search.
+3. Do not include markdown, comments, or extra text.
+4. Do not reference this prompt.
+
+## Sentences:
+{numbered}
+
+## Output Example:
+["keyword one", "keyword two"]
+""".strip()
+
+
+def generate_sentence_keywords(
+    video_script: str,
+) -> Tuple[Optional[List[str]], Optional[str]]:
+    sentences = split_script_sentences(video_script)
+    if not sentences:
+        return None, "no sentences"
+
+    prompt = _build_sentence_keywords_prompt(sentences)
+    try:
+        response = _generate_response(
+            prompt,
+            disable_thinking=True,
+            expected_keyword_count=len(sentences),
+        )
+    except Exception:
+        return None, "provider error"
+    if not response or response.startswith("Error:"):
+        return None, "provider error"
+
+    try:
+        keywords = parse_sentence_keywords_response(response, len(sentences))
+    except ValueError as exc:
+        return None, str(exc)
+    except Exception:
+        return None, "parse error"
+
+    logger.info(
+        f"sentence keywords parsed: {len(keywords)} terms for {len(sentences)} sentences"
+    )
+    return keywords, None
+
+
+def _sentence_keyword_response_format(expected_count: int) -> dict:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "sentence_keywords",
+            "strict": True,
+            "schema": {
+                "type": "array",
+                "minItems": expected_count,
+                "maxItems": expected_count,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                },
+            },
+        },
+    }
+
+
+def _generate_response(
+    prompt: str,
+    *,
+    disable_thinking: bool = False,
+    expected_keyword_count: Optional[int] = None,
+) -> str:
     try:
         content = ""
         llm_provider = config.app.get("llm_provider", "openai")
@@ -270,9 +429,19 @@ def _generate_response(prompt: str) -> str:
                     base_url=base_url,
                 )
 
-            response = client.chat.completions.create(
-                model=model_name, messages=[{"role": "user", "content": prompt}]
-            )
+            completion_kwargs = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if llm_provider == "ollama" and disable_thinking:
+                completion_kwargs["extra_body"] = {"reasoning_effort": "none"}
+                completion_kwargs["max_tokens"] = 128
+                if expected_keyword_count:
+                    completion_kwargs["response_format"] = (
+                        _sentence_keyword_response_format(expected_keyword_count)
+                    )
+
+            response = client.chat.completions.create(**completion_kwargs)
             if response:
                 if isinstance(response, ChatCompletion):
                     content = response.choices[0].message.content
