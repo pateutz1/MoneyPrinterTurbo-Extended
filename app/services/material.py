@@ -1,7 +1,8 @@
 import os
 import random
+import re
 import threading
-from typing import List
+from typing import List, Set
 from urllib.parse import urlencode
 
 import requests
@@ -15,6 +16,86 @@ from app.services import semantic_video
 
 _requested_count = 0
 _requested_count_lock = threading.Lock()
+_DISABLE_HTTP_STATUSES = {401, 403, 429}
+_VIBE_SUFFIXES = ("aesthetic", "lofi art", "futuristic", "black and white")
+_PROVIDER_KEY_CFG = {
+    "pexels": "pexels_api_keys",
+    "pixabay": "pixabay_api_keys",
+}
+
+
+class StockProviderDisabled(Exception):
+    def __init__(self, provider: str, status_code: int):
+        self.provider = provider
+        self.status_code = status_code
+        super().__init__(f"{provider} HTTP {status_code}")
+
+
+def _safe_exc_text(exc: BaseException) -> str:
+    return re.sub(r"(?i)([?&]key=)[^&\s]+", r"\1REDACTED", f"{type(exc).__name__}: {exc}")
+
+
+def has_api_key(cfg_key: str) -> bool:
+    api_keys = config.app.get(cfg_key)
+    if not api_keys:
+        return False
+    if isinstance(api_keys, str):
+        return bool(api_keys.strip())
+    if isinstance(api_keys, (list, tuple)):
+        return any(isinstance(k, str) and k.strip() for k in api_keys)
+    return False
+
+
+def simplify_search_term(search_term: str) -> str:
+    original = " ".join((search_term or "").split())
+    if not original:
+        return ""
+
+    lowered = original.lower()
+    simplified = original
+    for suffix in _VIBE_SUFFIXES:
+        token = f" {suffix}"
+        if lowered.endswith(token):
+            simplified = original[: -len(token)].rstrip()
+            break
+
+    tokens = simplified.split()
+    if len(tokens) > 2:
+        simplified = " ".join(tokens[:2])
+    elif len(tokens) == 2 and simplified.lower() == original.lower():
+        simplified = tokens[0]
+
+    if not simplified or simplified.lower() == original.lower():
+        return ""
+    return simplified
+
+
+def _query_variants(search_term: str) -> List[str]:
+    variants = []
+    seen = set()
+    for candidate in (search_term, simplify_search_term(search_term)):
+        normalized = " ".join((candidate or "").split())
+        if not normalized:
+            continue
+        key = normalized.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        variants.append(candidate if candidate == search_term else normalized)
+    return variants
+
+
+def _provider_order(source: str) -> List[str]:
+    primary = "pixabay" if source == "pixabay" else "pexels"
+    secondary = "pexels" if primary == "pixabay" else "pixabay"
+    return [primary, secondary]
+
+
+def _ensure_provider_available(provider: str, response) -> None:
+    status = getattr(response, "status_code", 0)
+    if status in _DISABLE_HTTP_STATUSES:
+        logger.warning(f"{provider} disabled for this operation (HTTP {status})")
+        raise StockProviderDisabled(provider, status)
 
 
 def get_api_key(cfg_key: str):
@@ -22,7 +103,6 @@ def get_api_key(cfg_key: str):
     if not api_keys:
         raise ValueError(
             f"\n\n##### {cfg_key} is not set #####\n\nPlease set it in the config.toml file: {config.config_file}\n\n"
-            f"{utils.to_json(config.app)}"
         )
 
     # if only one key is provided, return it
@@ -60,6 +140,7 @@ def search_videos_pexels(
             proxies=config.proxy,
             timeout=(30, 60),
         )
+        _ensure_provider_available("pexels", r)
         response = r.json()
         video_items = []
         if "videos" not in response:
@@ -93,8 +174,10 @@ def search_videos_pexels(
                     video_items.append(item)
                     break
         return video_items
+    except StockProviderDisabled:
+        raise
     except Exception as e:
-        logger.error(f"search videos failed: {str(e)}")
+        logger.error(f"search videos failed: {_safe_exc_text(e)}")
 
     return []
 
@@ -117,12 +200,13 @@ def search_videos_pixabay(
         "key": api_key,
     }
     query_url = f"https://pixabay.com/api/videos/?{urlencode(params)}"
-    logger.info(f"searching videos: {query_url}, with proxies: {config.proxy}")
+    logger.info(f"searching pixabay videos: query={search_term}, with proxies: {config.proxy}")
 
     try:
         r = requests.get(
             query_url, proxies=config.proxy, timeout=(30, 60)
         )
+        _ensure_provider_available("pixabay", r)
         response = r.json()
         video_items = []
         if "hits" not in response:
@@ -149,8 +233,10 @@ def search_videos_pixabay(
                     video_items.append(item)
                     break
         return video_items
+    except StockProviderDisabled:
+        raise
     except Exception as e:
-        logger.error(f"search videos failed: {str(e)}")
+        logger.error(f"search videos failed: {_safe_exc_text(e)}")
 
     return []
 
@@ -232,38 +318,65 @@ def download_videos(
     # Group videos by search term for balanced sampling
     videos_by_term = {}
     found_duration = 0.0
-    search_videos = search_videos_pexels
-    if source == "pixabay":
-        search_videos = search_videos_pixabay
+    providers = _provider_order(source)
+    primary = providers[0]
+    search_fns = {
+        "pexels": search_videos_pexels,
+        "pixabay": search_videos_pixabay,
+    }
+    disabled_providers: Set[str] = set()
+    skipped_no_key: Set[str] = set()
 
     # Global URL tracking to prevent duplicates across all search terms
     global_video_urls = set()
-    
-    for search_term in search_terms:
-        video_items = search_videos(
-            search_term=search_term,
-            minimum_duration=max_clip_duration,
-            video_aspect=video_aspect,
-        )
-        logger.info(f"found {len(video_items)} videos for '{search_term}'")
 
-        # Filter out duplicates and associate with search term
+    def _query_provider(provider: str, query: str):
+        if provider in disabled_providers:
+            return None
+        cfg_key = _PROVIDER_KEY_CFG[provider]
+        if not has_api_key(cfg_key):
+            if provider not in skipped_no_key:
+                logger.info(f"{provider} skipped (no key)")
+                skipped_no_key.add(provider)
+            return None
+        try:
+            return search_fns[provider](
+                search_term=query,
+                minimum_duration=max_clip_duration,
+                video_aspect=video_aspect,
+            )
+        except StockProviderDisabled:
+            disabled_providers.add(provider)
+            return None
+
+    for search_term in search_terms:
         unique_videos = []
         duplicates_removed = 0
-        
-        for item in video_items:
-            # Check for URL duplicates across all search terms
-            if item.url not in global_video_urls:
-                item.search_term = search_term
-                unique_videos.append(item)
-                global_video_urls.add(item.url)
-                found_duration += item.duration
-            else:
-                duplicates_removed += 1
-        
+        for query in _query_variants(search_term):
+            if unique_videos:
+                break
+            for provider in providers:
+                video_items = _query_provider(provider, query)
+                if video_items is None:
+                    continue
+                logger.info(
+                    f"found {len(video_items)} videos for '{query}' via {provider}"
+                )
+                for item in video_items:
+                    if item.url not in global_video_urls:
+                        item.search_term = search_term
+                        unique_videos.append(item)
+                        global_video_urls.add(item.url)
+                        found_duration += item.duration
+                    else:
+                        duplicates_removed += 1
+                if unique_videos:
+                    logger.info(f"using {provider} results for '{query}'")
+                    break
+
         if duplicates_removed > 0:
             logger.info(f"removed {duplicates_removed} duplicate URLs for '{search_term}'")
-        
+
         if unique_videos:
             videos_by_term[search_term] = unique_videos
 

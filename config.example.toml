@@ -16,6 +16,7 @@ pexels_api_keys = []
 # You can use multiple keys to avoid rate limits.
 # For example: pixabay_api_keys = ["123adsf4567adf89","abd1321cd13efgfdfhi"]
 # 特别注意格式，Key 用英文双引号括起来，多个Key用逗号隔开
+# Empty pixabay_api_keys skips Pixabay fallback; Pexels-only search continues.
 pixabay_api_keys = []
 
 # 支持的提供商 (Supported providers):
