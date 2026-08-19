@@ -5,6 +5,10 @@ video_source = "pexels" # "pexels" or "pixabay"
 # Falls back to global generate_terms when disabled or on any failure.
 enable_sentence_keywords = false
 
+# Generate a JPEG thumbnail beside each completed final MP4.
+# Saved as `<video-stem>-thumbnail.jpg` using a frame at one-third duration.
+enable_thumbnail = false
+
 # 是否隐藏配置面板
 hide_config = false
 

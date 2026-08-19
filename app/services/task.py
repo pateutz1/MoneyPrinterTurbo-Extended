@@ -9,6 +9,7 @@ from app.config import config
 from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
 from app.services import llm, material, subtitle, video, voice
+from app.services import thumbnail as thumbnail_service
 from app.services import state as sm
 from app.utils import utils
 
@@ -216,6 +217,18 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
         return downloaded_videos
 
 
+def _maybe_generate_thumbnail(params, final_video_path: str) -> None:
+    if not config.app.get("enable_thumbnail", False):
+        return
+    if not path.isfile(final_video_path) or path.getsize(final_video_path) <= 0:
+        return
+    thumbnail_service.generate_thumbnail(
+        final_video_path,
+        title=params.video_subject or "",
+        font_name=params.font_name or "",
+    )
+
+
 def generate_final_videos(
     task_id, params, downloaded_videos, audio_file, subtitle_path, video_script=""
 ):
@@ -265,6 +278,8 @@ def generate_final_videos(
             output_file=final_video_path,
             params=params,
         )
+
+        _maybe_generate_thumbnail(params, final_video_path)
 
         _progress += 50 / params.video_count / 2
         sm.state.update_task(task_id, progress=_progress)
