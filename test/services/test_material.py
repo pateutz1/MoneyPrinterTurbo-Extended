@@ -107,6 +107,8 @@ class TestDownloadVideosFallback(unittest.TestCase):
             "app.services.material.save_video", side_effect=_fake_save
         ), patch(
             "app.services.material.has_api_key", side_effect=fake_has_key
+        ), patch(
+            "app.services.pinterest.is_enabled", return_value=False
         ):
             paths = material.download_videos(
                 task_id="t-fallback",

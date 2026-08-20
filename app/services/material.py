@@ -306,6 +306,41 @@ def save_video(video_url: str, save_dir: str = "", search_term: str = "", thumbn
     return ""
 
 
+def _try_pinterest_fallback(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect,
+    global_video_urls: Set[str],
+) -> List[MaterialInfo]:
+    from app.services import pinterest as pinterest_service
+
+    if not pinterest_service.is_enabled():
+        return []
+    try:
+        items = pinterest_service.search_videos(
+            search_term=search_term,
+            minimum_duration=minimum_duration,
+            video_aspect=video_aspect,
+        )
+    except Exception:
+        logger.warning("pinterest fallback failed: unexpected error")
+        return []
+
+    unique_videos: List[MaterialInfo] = []
+    for item in items or []:
+        pin_url = pinterest_service.normalize_pin_url(getattr(item, "url", ""))
+        if not pin_url or pin_url in global_video_urls:
+            continue
+        item.url = pin_url
+        item.provider = "pinterest"
+        item.search_term = search_term
+        unique_videos.append(item)
+        global_video_urls.add(pin_url)
+    if unique_videos:
+        logger.info(f"using pinterest results for '{search_term}'")
+    return unique_videos
+
+
 def download_videos(
     task_id: str,
     search_terms: List[str],
@@ -377,6 +412,17 @@ def download_videos(
         if duplicates_removed > 0:
             logger.info(f"removed {duplicates_removed} duplicate URLs for '{search_term}'")
 
+        if not unique_videos:
+            unique_videos = _try_pinterest_fallback(
+                search_term=search_term,
+                minimum_duration=max_clip_duration,
+                video_aspect=video_aspect,
+                global_video_urls=global_video_urls,
+            )
+            for item in unique_videos:
+                if getattr(item, "duration", 0) > 0:
+                    found_duration += item.duration
+
         if unique_videos:
             videos_by_term[search_term] = unique_videos
 
@@ -434,6 +480,15 @@ def download_videos(
 
     total_duration = 0.0
     downloaded_urls = set()  # Track downloaded URLs to prevent runtime duplicates
+    pinterest_downloads_done = 0
+    pinterest_download_limit = 0
+    pinterest_attempts_done = 0
+    pinterest_attempt_limit = 0
+    from app.services import pinterest as pinterest_service
+
+    if pinterest_service.is_enabled():
+        pinterest_download_limit = pinterest_service.max_downloads()
+        pinterest_attempt_limit = pinterest_service.max_attempts()
     
     for item in valid_video_items:
         try:
@@ -445,14 +500,39 @@ def download_videos(
             logger.info(f"downloading video: {item.url}")
             # Use the search term associated with this specific video item
             item_search_term = getattr(item, 'search_term', 'unknown')
-            saved_video_path = save_video(
-                video_url=item.url, save_dir=material_directory, search_term=item_search_term, thumbnail_url=item.thumbnail_url, preview_images=item.preview_images
-            )
+            if getattr(item, "provider", "") == "pinterest":
+                from app.services import pinterest as pinterest_service
+
+                if pinterest_downloads_done >= pinterest_download_limit:
+                    logger.info("pinterest download cap reached for this operation")
+                    continue
+                if pinterest_attempts_done >= pinterest_attempt_limit:
+                    logger.info("pinterest attempt cap reached for this operation")
+                    continue
+
+                pinterest_attempts_done += 1
+                saved_video_path, actual_duration = pinterest_service.download_pin_video(
+                    item.url,
+                    save_dir=material_directory,
+                    video_aspect=video_aspect,
+                    minimum_duration=max_clip_duration,
+                )
+                item.duration = actual_duration
+            else:
+                saved_video_path = save_video(
+                    video_url=item.url, save_dir=material_directory, search_term=item_search_term, thumbnail_url=item.thumbnail_url, preview_images=item.preview_images
+                )
+                actual_duration = float(getattr(item, "duration", 0) or 0)
             if saved_video_path:
                 logger.info(f"video saved: {saved_video_path} (search_term: '{item_search_term}')")
                 video_paths.append(saved_video_path)
                 downloaded_urls.add(item.url)
-                seconds = min(max_clip_duration, item.duration)
+                if getattr(item, "provider", "") == "pinterest":
+                    pinterest_downloads_done += 1
+                seconds = min(
+                    max_clip_duration,
+                    actual_duration if getattr(item, "provider", "") == "pinterest" else item.duration,
+                )
                 total_duration += seconds
                 if total_duration > audio_duration:
                     logger.info(
@@ -460,7 +540,10 @@ def download_videos(
                     )
                     break
         except Exception as e:
-            logger.error(f"failed to download video: {utils.to_json(item)} => {str(e)}")
+            if getattr(item, "provider", "") == "pinterest":
+                logger.warning(f"pinterest download failed: {type(e).__name__}")
+            else:
+                logger.error(f"failed to download video: {utils.to_json(item)} => {str(e)}")
     
     # Final diversity report
     logger.success(f"downloaded {len(video_paths)} videos")

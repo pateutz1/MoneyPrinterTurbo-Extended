@@ -1,0 +1,10 @@
+# Optional last-resort Pinterest fallback. Not required for Pexels/Pixabay.
+# Install only if you enable enable_pinterest in config.toml:
+#   pip install -r requirements-optional.txt
+#   playwright install chromium
+#
+# Not a Pinterest ToS or licensing approval. Verify current Pinterest terms
+# before any live use.
+
+playwright>=1.40.0
+yt-dlp>=2023.12.0

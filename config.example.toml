@@ -9,6 +9,20 @@ enable_sentence_keywords = false
 # Saved as `<video-stem>-thumbnail.jpg` using a frame at one-third duration.
 enable_thumbnail = false
 
+# Last-resort Pinterest fallback after Pexels and Pixabay return no usable clips.
+# Disabled by default. Optional deps only: pip install -r requirements-optional.txt
+# then run: playwright install chromium
+# This is not Pinterest Terms-of-Service or licensing approval. Before enabling,
+# verify current Pinterest terms on automated access, content reuse rights,
+# and commercial-use rules. Live Pinterest access is not required for unit tests.
+enable_pinterest = false
+pinterest_max_pins = 5
+pinterest_max_downloads = 2
+pinterest_max_attempts = 3
+pinterest_timeout_seconds = 45
+pinterest_scroll_count = 2
+pinterest_max_file_bytes = 52428800
+
 # 是否隐藏配置面板
 hide_config = false
 
